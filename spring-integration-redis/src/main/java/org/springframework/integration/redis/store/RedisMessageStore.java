@@ -16,20 +16,13 @@
 
 package org.springframework.integration.redis.store;
 
-import java.util.Collection;
-import java.util.Set;
-
-import org.springframework.data.redis.connection.RedisConnectionFactory;
-import org.springframework.data.redis.core.BoundValueOperations;
 import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.data.redis.serializer.JdkSerializationRedisSerializer;
-import org.springframework.data.redis.serializer.RedisSerializer;
-import org.springframework.data.redis.serializer.SerializationException;
-import org.springframework.data.redis.serializer.StringRedisSerializer;
-import org.springframework.integration.store.AbstractKeyValueMessageStore;
-import org.springframework.integration.store.MessageGroupStore;
-import org.springframework.integration.store.MessageStore;
-import org.springframework.util.Assert;
+import org.springframework.integration.store.*;
+import org.springframework.messaging.Message;
+
+import java.util.*;
+
+import static java.lang.System.currentTimeMillis;
 
 /**
  * Redis implementation of the key/value style {@link MessageStore} and {@link MessageGroupStore}
@@ -38,62 +31,148 @@ import org.springframework.util.Assert;
  * @author Gary Russell
  * @since 2.1
  */
-public class RedisMessageStore extends AbstractKeyValueMessageStore {
+public class RedisMessageStore extends AbstractMessageGroupStore {
 
-	private final RedisTemplate<Object, Object> redisTemplate;
+    private final static String MESSAGE_KEY_PREFIX = "MESSAGE_";
+    private final static String LAST_RELEASED_SEQ_NUM_KEY = "LAST_RELEASED_SEQ_NUM";
+    private final static String COMPLETE_KEY = "COMPLETE";
+    private final static String LAST_MODIFIED_KEY = "LAST_MODIFIED";
+    private final static String TIMESTAMP_KEY = "TIMESTAMP";
 
-	public RedisMessageStore(RedisConnectionFactory connectionFactory) {
-		this.redisTemplate = new RedisTemplate<Object, Object>();
-		this.redisTemplate.setConnectionFactory(connectionFactory);
-		this.redisTemplate.setKeySerializer(new StringRedisSerializer());
-		this.redisTemplate.setValueSerializer(new JdkSerializationRedisSerializer());
-		this.redisTemplate.afterPropertiesSet();
-	}
+    private final RedisTemplate<Object, Object> redisTemplate;
 
-	public void setValueSerializer(RedisSerializer<?> valueSerializer) {
-		Assert.notNull(valueSerializer, "'valueSerializer' must not be null");
-		this.redisTemplate.setValueSerializer(valueSerializer);
-	}
-
-	@Override
-	protected Object doRetrieve(Object id){
-		Assert.notNull(id, "'id' must not be null");
-		BoundValueOperations<Object, Object> ops = redisTemplate.boundValueOps(id);
-		return ops.get();
-	}
+    public RedisMessageStore(RedisTemplate<Object, Object> redisTemplate) {
+        this.redisTemplate = redisTemplate;
+    }
 
 
-	@Override
-	protected void doStore(Object id, Object objectToStore) {
-		Assert.notNull(id, "'id' must not be null");
-		Assert.notNull(objectToStore, "'objectToStore' must not be null");
-		BoundValueOperations<Object, Object> ops = redisTemplate.boundValueOps(id);
-		try {
-			ops.set(objectToStore);
-		}
-		catch (SerializationException e) {
-			throw new IllegalArgumentException("If relying on the default RedisSerializer (JdkSerializationRedisSerializer) " +
-					"the Object must be Serializable. Either make it Serializable or provide your own implementation of " +
-					"RedisSerializer via 'setValueSerializer(..)'", e);
-		}
-	}
+    @Override
+    public MessageGroup removeMessageFromGroup(Object groupId, Message<?> messageToRemove) {
+        redisTemplate.opsForHash().delete(groupId, makeMessageKey(messageToRemove));
+        modify(groupId);
+        return getMessageGroup(groupId);
+    }
+
+    @Override
+    public void setLastReleasedSequenceNumberForGroup(Object groupId, int sequenceNumber) {
+        modify(groupId, LAST_RELEASED_SEQ_NUM_KEY, sequenceNumber);
+    }
+
+    @Override
+    public Iterator<MessageGroup> iterator() {
+        Set<Object> groupIds = redisTemplate.keys("*");
+        return new MessageGroupIterator(groupIds.iterator());
+    }
+
+    @Override
+    public void completeGroup(Object groupId) {
+        modify(groupId, COMPLETE_KEY, true);
+    }
+
+    @Override
+    public int messageGroupSize(Object groupId) {
+        int count = 0;
+        for (Map.Entry<Object, Object> entry : redisTemplate.opsForHash().entries(groupId).entrySet()) {
+            if (((String) entry.getKey()).startsWith(MESSAGE_KEY_PREFIX)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    @Override
+    public MessageGroup getMessageGroup(Object groupId) {
+        return createMessageGroup(groupId, redisTemplate.opsForHash().entries(groupId));
+    }
+
+    private MessageGroup createMessageGroup(Object groupId, Map<Object, Object> entries) {
+        Long valueTimestamp = (Long) entries.get(TIMESTAMP_KEY);
+        Boolean valueComplete = (Boolean) entries.get(COMPLETE_KEY);
+        Integer valueLastReleasedSeqNum = (Integer) entries.get(LAST_RELEASED_SEQ_NUM_KEY);
+        Long valueLastModified = (Long) entries.get(LAST_MODIFIED_KEY);
+
+        Collection<? extends Message<?>> messages = getMessagesFromGroup(entries);
+        long timestamp = valueTimestamp != null ? valueTimestamp : 0;
+        boolean complete = valueComplete != null ? valueComplete : false;
+        int lastReleasedSeqNum = valueLastReleasedSeqNum != null ? valueLastReleasedSeqNum : 0;
+        long lastModified = valueLastModified != null ? valueLastModified : 0;
+
+        SimpleMessageGroup messageGroup = new SimpleMessageGroup(messages, groupId, timestamp, complete);
+        messageGroup.setLastReleasedMessageSequenceNumber(lastReleasedSeqNum);
+        messageGroup.setLastModified(lastModified);
+
+        return messageGroup;
+    }
+
+    private Collection<? extends Message<?>> getMessagesFromGroup(Map<Object, Object> entries) {
+        List<Message<?>> result = new ArrayList<Message<?>>(entries.size());
+        for (Map.Entry<Object, Object> entry : entries.entrySet()) {
+            String key = (String) entry.getKey();
+            if (key.startsWith(MESSAGE_KEY_PREFIX)) {
+                result.add((Message<?>) entry.getValue());
+            }
+        }
+        return result;
+    }
+
+    @Override
+    public MessageGroup addMessageToGroup(Object groupId, Message<?> message) {
+        modify(groupId, makeMessageKey(message), message);
+        redisTemplate.opsForHash().putIfAbsent(groupId, TIMESTAMP_KEY, currentTimeMillis());
+        return getMessageGroup(groupId);
+    }
+
+    @Override
+    public Message<?> pollMessageFromGroup(Object groupId) {
+        Message<?> message = getMessageGroup(groupId).getOne();
+        redisTemplate.opsForHash().delete(groupId, makeMessageKey(message));
+        modify(groupId);
+        return message;
+    }
+
+    @Override
+    public void removeMessageGroup(Object groupId) {
+        redisTemplate.opsForHash().delete(groupId, redisTemplate.opsForHash().keys(groupId).toArray());
+    }
 
 
-	@Override
-	protected Object doRemove(Object id) {
-		Assert.notNull(id, "'id' must not be null");
-		Object removedObject = this.doRetrieve(id);
-		if (removedObject != null){
-			redisTemplate.delete(id);
-		}
-		return removedObject;
-	}
+    private void modify(Object groupId, Object key, Object value) {
+        Map<Object, Object> modification = new HashMap<Object, Object>(4);
+        modification.put(key, value);
+        modification.put(LAST_MODIFIED_KEY, currentTimeMillis());
+        redisTemplate.opsForHash().putAll(groupId, modification);
+    }
+
+    private void modify(Object groupId) {
+        redisTemplate.opsForHash().put(groupId, LAST_MODIFIED_KEY, currentTimeMillis());
+    }
+
+    private String makeMessageKey(Message<?> message) {
+        return MESSAGE_KEY_PREFIX + message.getHeaders().getId();
+    }
 
 
-	@Override
-	protected Collection<?> doListKeys(String keyPattern) {
-		Assert.hasText(keyPattern, "'keyPattern' must not be empty");
-		Set<Object> keys = redisTemplate.keys(keyPattern);
-		return keys;
-	}
+    private class MessageGroupIterator implements Iterator<MessageGroup> {
+
+        private final Iterator<?> idIterator;
+
+        private MessageGroupIterator(Iterator<?> idIterator) {
+            this.idIterator = idIterator;
+        }
+
+        @Override
+        public boolean hasNext() {
+            return idIterator.hasNext();
+        }
+
+        @Override
+        public MessageGroup next() {
+            return getMessageGroup(idIterator.next());
+        }
+
+        @Override
+        public void remove() {
+            throw new UnsupportedOperationException();
+        }
+    }
 }
